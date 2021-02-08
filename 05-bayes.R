@@ -1,6 +1,8 @@
-img_open <- function(img_lst, blk_rows, blk_cols, ovr_rows = 0, ovr_cols = 0) {
+source("scripts/pb_snow.R")
 
-  img <- sf:::CPL_read_gdal(img_lst[[1]],
+img_open <- function(files, blk_rows, blk_cols, ovr_rows = 0, ovr_cols = 0) {
+
+  img <- sf:::CPL_read_gdal(files[[1]],
                             options = character(0),
                             driver = character(0),
                             read_data = FALSE,
@@ -31,17 +33,23 @@ img_open <- function(img_lst, blk_rows, blk_cols, ovr_rows = 0, ovr_cols = 0) {
     ovr_y_off = ovr_y_off,
     ovr_x_size = ovr_x_size,
     ovr_y_size = ovr_y_size,
-    img_lst = img_lst
+    files = files
   ), class = "img")
 }
 
-img_read_block <- function(img, x_block, y_block) {
+img_read_block <- function(img, x_block, y_block, cl = NULL) {
 
+  stopifnot(requireNamespace("sf"))
   stopifnot(inherits(img, "img"))
   stopifnot(x_block >= 1)
   stopifnot(y_block >= 1)
   stopifnot(x_block <= img$x_blocks)
   stopifnot(y_block <= img$y_blocks)
+
+  if (!is.null(cl)) {
+    stopifnot(inherits(cl, "cluster"))
+    stopifnot(requireNamespace("snow"))
+  }
 
   options <- list(nXOff = img$ovr_x_off[[x_block]],
                   nYOff = img$ovr_y_off[[y_block]],
@@ -50,19 +58,50 @@ img_read_block <- function(img, x_block, y_block) {
                   nBufXSize = img$ovr_x_size[[x_block]],
                   nBufYSize = img$ovr_y_size[[y_block]])
 
-  data <- sf:::CPL_read_gdal(img$img_lst[[1]],
-                            options = character(0),
-                            driver = character(0),
-                            read_data = TRUE,
-                            NA_value = numeric(0),
-                            RasterIO_parameters = options)
+  data_lst <- .apply_cluster(cl = cl,
+                             x = img$files,
+                             fun = sf:::CPL_read_gdal,
+                             options = character(0),
+                             driver = character(0),
+                             read_data = TRUE,
+                             NA_value = numeric(0),
+                             RasterIO_parameters = options,
+                             .quiet = TRUE)
+
+  .get_data <- function(x) {
+    # simplify2array(
+      lapply(x, function(y) {
+      # c(
+        attr(y, which = "data")
+        # )
+    })
+    # )
+  }
+
+  .get_driver <- function(x) {
+    x[[1]]$driver[[1]]
+  }
+
+  .get_datatype <- function(x) {
+    x[[1]]$datatype
+  }
+
+  .get_wkt <- function(x) {
+    if (is.null(x[[1]]$wkt))
+      return(x[[1]]$crs$wkt)
+    x[[1]]$wkt
+  }
+
+  .get_geotransform <- function(x) {
+    x[[1]]$geotransform
+  }
 
   structure(list(
-    data = attr(data, "data"),
-    driver = data$driver[[1]],
-    datatype = data$datatype,
-    wkt = data$crs$wkt,
-    geotransform = data$geotransform,
+    data = .get_data(data_lst),
+    driver = .get_driver(data_lst),
+    datatype = .get_datatype(data_lst),
+    wkt = .get_wkt(data_lst),
+    geotransform = .get_geotransform(data_lst),
     x_from = img$x_off[[x_block]],
     y_from = img$y_off[[y_block]],
     x_off = img$x_off[[x_block]] - img$ovr_x_off[[x_block]] + 1,
@@ -72,13 +111,46 @@ img_read_block <- function(img, x_block, y_block) {
   ), class = "img_chunk")
 }
 
-img <- img_open(logit1_outfile, blk_rows = 50, blk_cols = 50,
-                ovr_rows = 4, ovr_cols = 4)
+library(magrittr)
+items <- rstac::stac("http://datacube-005.dpi.inpe.br:8010/stac/") %>%
+  rstac::stac_search(collections = "CB4_64_16D_STK-1",
+                     limit = 1000) %>%
+  rstac::ext_query("bdc:tile" == "022024") %>%
+  rstac::post_request() %>%
+  rstac::items_fetch()
 
-test <- img_read_block(img, 2, 2)
+.set_url_query_string <- function(url, query_string = NULL) {
+  if (is.null(query_string) || !any(stringr::str_detect(url, "^(https?://)")))
+    return(url)
+
+  ensurer::ensure_that(query_string, all(nzchar(names(.))))
+  sep <- "?"
+  # TODO: set only those elements that satisfies bellow condition
+  if (any(stringr::str_detect(url, "^(https?://.+/.*\\?.*)"))) sep <- "&"
+  paste0(url, sep, paste0(names(query_string), "=",
+                          query_string, collapse = "&"))
+}
+
+.set_url_gdal_vsicurl <- function(url) {
+  stringr::str_replace(url, "^(https?://)", "/vsicurl/\\1")
+}
+
+get_bdc_access_key <- function() {
+  list(access_token = Sys.getenv("BDC_ACCESS_KEY"))
+}
+
+files <- items %>%
+  rstac::items_reap("assets", "EVI", "href") %>%
+  .set_url_query_string(get_bdc_access_key()) %>%
+  .set_url_gdal_vsicurl()
+
+img <- img_open(files, blk_rows = 512, blk_cols = 512,
+                ovr_rows = 0, ovr_cols = 0)
+system.time({test <- img_read_block(img, 9, 7)})
 
 img_write_block <- function(test, file = "test.tif") {
 
+  test$data[test$x_off]
   sf:::CPL_write_gdal(x,
                       fname = file,
                       driver = "GTiff",
